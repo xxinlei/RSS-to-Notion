@@ -1,5 +1,6 @@
 import feedparser
 from bs4 import BeautifulSoup
+from xml.etree import ElementTree as ET
 
 import re
 import json
@@ -24,16 +25,33 @@ def parse_rss_entries(url, retries=3):
 			error_code = 0
 		except requests.exceptions.ProxyError as e:
 			print(f"Load {url} Error, Attempt {attempt + 1} failed: {e}")
-			time.sleep(1)  # 等待1秒后重试
+			time.sleep(1)
 			error_code = 1
 		except requests.exceptions.ConnectTimeout as e:
 			print(f"Load {url} Timeout, Attempt {attempt + 1} failed: {e}")
-			time.sleep(1)  # 等待1秒后重试
+			time.sleep(1)
 			error_code = 1
 
 		if error_code == 0:
 			parsed_feed = feedparser.parse(res.content)
 			soup = BeautifulSoup(res.content, 'xml')
+
+
+			ns = {'content': 'http://purl.org/rss/1.0/modules/content/'}
+			content_map = {}
+			try:
+				root = ET.fromstring(res.content)
+				for item in root.findall('./channel/item'):
+					link_el = item.find('link')
+					# link 在 RSS 裡有時是 text，有時是 tail
+					link_text = link_el.text if link_el is not None else None
+					if link_text is None and link_el is not None:
+						link_text = link_el.tail
+					content_el = item.find('content:encoded', ns)
+					if content_el is not None and link_text:
+						content_map[link_text.strip()] = content_el.text or ""
+			except Exception as e:
+				print(f"解析 content:encoded 失敗: {e}")
 
 			## Update RSS Feed Status
 			feed_title = soup.find('title').text if soup.find('title') else 'No title available'
@@ -51,38 +69,43 @@ def parse_rss_entries(url, retries=3):
 				if not published_time.tzinfo:
 					published_time = published_time.replace(tzinfo=timezone(timedelta(hours=8)))
 				if now - published_time < timedelta(days=load_time):
-					cover = BeautifulSoup(entry.get("summary"),'html.parser')
+					cover = BeautifulSoup(entry.get("summary"), 'html.parser')
 					cover_list = cover.find_all('img')
 					src = "https://www.notion.so/images/page-cover/rijksmuseum_avercamp_1620.jpg" if not cover_list else cover_list[0]['src']
-					# Use re.search to find the first match
+
+					entry_link = entry.get("link", "").strip()
+
+			
+					full_html = content_map.get(entry_link, "")
+					if full_html:
+						full_text = re.sub(r"<.*?>|\n*", "", full_html)
+					else:
+						full_text = re.sub(r"<.*?>|\n*", "", entry.get("summary", ""))
+
 					entries.append(
 						{
 							"title": entry.get("title"),
-							"link": entry.get("link"),
+							"link": entry_link,
 							"time": published_time.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S%z"),
-							"summary": re.sub(r"<.*?>|\n*", "", entry.get("summary"))[:2000],
-							"content": entry.get("content"),
+							"summary": re.sub(r"<.*?>|\n*", "", entry.get("summary", ""))[:500],  
+							"full_text": full_text, 
 							"cover": src
 						}
-				)
+					)
 
 			return feeds, entries[:50]
-			# return feeds, entries[:3]	
-		
+
 	feeds = {
 		"title": "Unknown",
 		"link": url,
 		"status": "Error"
 	}
-
-		
 	return feeds, None
 
 
 class NotionAPI:
 	NOTION_API_pages = "https://api.notion.com/v1/pages"
 	NOTION_API_database = "https://api.notion.com/v1/databases"
-
 
 	def __init__(self, secret, read, feed) -> None:
 		self.reader_id = read
@@ -92,17 +115,10 @@ class NotionAPI:
 			"Notion-Version": "2022-06-28",
 			"Content-Type": "application/json",
 		}
-		# self.delete_rss()
 
 	def queryFeed_from_notion(self):
-		"""
-		从URL Database里读取url和page_id
-
-		return:
-		dict with "url" and "page_id"
-		"""
 		rss_feed_list = []
-		url=f"{self.NOTION_API_database}/{self.feeds_id}/query"
+		url = f"{self.NOTION_API_database}/{self.feeds_id}/query"
 		payload = {
 			"page_size": 100,
 			"filter": {
@@ -112,17 +128,10 @@ class NotionAPI:
 		}
 		response = requests.post(url, headers=self.headers, json=payload)
 
-		# Check Status
 		if response.status_code != 200:
 			raise Exception(f"Failed to query Notion database: {response.text}")
-		
-		# Grab requests
+
 		data = response.json()
-
-		# Dump the requested JSON file for test
-		# with open('db.json', 'w', encoding='utf8') as f:
-		# 	json.dump(data, f, ensure_ascii=False, indent=4)
-
 		rss_feed_list = []
 		for page in data['results']:
 			props = page["properties"]
@@ -135,20 +144,33 @@ class NotionAPI:
 					"tags": name_color_pairs
 				}
 			)
-
 		return rss_feed_list
 
+	def _split_text_blocks(self, text, block_size=2000):
+		"""Notion 單個 rich_text 最多 2000 字，超過需要切割成多個 paragraph"""
+		blocks = []
+		for i in range(0, len(text), block_size):
+			chunk = text[i:i + block_size]
+			blocks.append({
+				"type": "paragraph",
+				"paragraph": {
+					"rich_text": [
+						{
+							"type": "text",
+							"text": {"content": chunk},
+						}
+					]
+				},
+			})
+		return blocks
+
 	def saveEntry_to_notion(self, entry, page_id, tags):
-		"""
-		Save entry lists into reading database
+		
+		body_text = entry.get("full_text") or entry.get("summary") or ""
 
-		params: entry("title", "link", "time", "summary"), page_id
+		
+		children_blocks = self._split_text_blocks(body_text)[:100]
 
-		return:
-		api response from notion
-		"""
-		# print(entry.get("cover"))
-		# Construct post request to reading database
 		payload = {
 			"parent": {"database_id": self.reader_id},
 			"cover": {
@@ -166,44 +188,20 @@ class NotionAPI:
 				},
 				"URL": {"url": entry.get("link")},
 				"Published": {"date": {"start": entry.get("time")}},
-				"Source":{
+				"Source": {
 					"relation": [{"id": page_id}]
 				},
 				"Tag": {
 					"multi_select": [{"name": tag[0], "color": tag[1]} for tag in tags]
 				}
 			},
-			"children": [
-				{
-					"type": "paragraph",
-					"paragraph": {
-						"rich_text": [
-							{
-								"type": "text",
-								"text": {"content": entry.get("summary")},
-							}
-						]
-					},
-				}
-			],
+			"children": children_blocks,
 		}
 		res = requests.post(url=self.NOTION_API_pages, headers=self.headers, json=payload)
-
-
 		print(res.status_code)
 		return res
-	
+
 	def saveFeed_to_notion(self, prop, page_id):
-		"""
-		Update feed info into URL database
-
-		params: prop("title", "status"), page_id
-
-		return:
-		api response from notion
-		"""
-
-		# Update to Notion
 		url = f"{self.NOTION_API_pages}/{page_id}"
 		payload = {
 			"parent": {"database_id": self.feeds_id},
@@ -216,41 +214,14 @@ class NotionAPI:
 						}
 					]
 				},
-				"Status":{
-					"select":{
+				"Status": {
+					"select": {
 						"name": prop.get("status"),
 						"color": "red" if prop.get("status") == "Error" else "green"
 					}
-					
 				}
 			},
 		}
-
 		res = requests.patch(url=url, headers=self.headers, json=payload)
 		print(res.status_code)
 		return res
-
-	## Todo: figure out deleting process
-	# def delete_rss(self):
-	# 	filter_json = {
-	# 		"filter": {
-	# 			"and": [
-	# 				{
-	# 					"property": "Check",
-	# 					"checkbox": {"equals": True},
-	# 				},
-	# 				{
-	# 					"property": "Published",
-	# 					"date": {"before": delete_time.strftime("%Y-%m-%dT%H:%M:%S%z")},
-	# 				},
-	# 			]
-	# 		}
-	# 	}
-	# 	results = requests.request("POST", url=f"{self.NOTION_API_database}/{self.reader_id}/query", headers=self.headers, json=filter_json).json().get("results")
-	# 	responses = []
-	# 	if len(results) != 0:
-	# 		for result in results:
-	# 			url = f"https://api.notion.com/v1/blocks/{result.get('id')}"
-	# 			responses += [requests.delete(url, headers=self.headers)]
-	# 	return responses
-	
